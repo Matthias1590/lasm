@@ -76,9 +76,27 @@ typedef struct {
 
 typedef struct {
 	sv_t name;
+	bb_t *bytes;
+	uint32_t index;
+	uint32_t *name_offset;
+	uint64_t *data_offset;
+	uint64_t *data_size;
+	uint32_t *link;
+	uint32_t *info;
+	bool rela_created;
+} section_t;
+
+void section_free(section_t *section) {
+	bb_free(section->bytes);
+	free(section);
+}
+
+typedef struct {
+	sv_t name;
 	size_t address;
 	size_t end_address;
 	size_t symbol_index;
+	section_t *section;
 } label_t;
 
 typedef struct {
@@ -108,10 +126,12 @@ void list_push(list_t *list, void *value) {
 	list->data[list->size++] = value;
 }
 
+typedef void (*free_func_t)(void *);
+
 /// @brief Frees a list.
 /// @param list The list to free.
 /// @param free_func The function to use to free each element in the list. If NULL, uses free.
-void list_free(list_t *list, void (*free_func)(void *)) {
+void list_free(list_t *list, free_func_t free_func) {
 	if (free_func == NULL) {
 		free_func = free;
 	}
@@ -437,7 +457,86 @@ void create_elf_section(bb_t *elf, uint16_t *section_header_entry_count,
 	(*section_header_entry_count)++;
 }
 
-bb_t *create_elf(bb_t *code, list_t *exports, list_t *patches) {
+// todo: allow for overwriting section type in section directive
+uint32_t get_section_type(section_t *section) {
+	if (sv_eq(section->name, sv_str(".text"))) {
+		return SHT_PROGBITS;
+	} else if (sv_eq(section->name, sv_str(".data"))) {
+		return SHT_PROGBITS;
+	} else {
+		assert(false && "unimplemented");
+	}
+}
+
+uint64_t get_section_flags(section_t *section) {
+	if (sv_eq(section->name, sv_str(".text"))) {
+		return SHF_EXECINSTR | SHF_ALLOC;
+	} else if (sv_eq(section->name, sv_str(".data"))) {
+		return SHF_WRITE | SHF_ALLOC;
+	} else {
+		assert(false && "unimplemented");
+	}
+}
+
+uint64_t get_section_vaddr(section_t *section) {
+	if (sv_eq(section->name, sv_str(".text"))) {
+		return 0;
+	} else if (sv_eq(section->name, sv_str(".data"))) {
+		return 0;  // todo: double check that this is ok
+	} else {
+		assert(false && "unimplemented");
+	}
+}
+
+uint64_t get_section_align(section_t *section) {
+	if (sv_eq(section->name, sv_str(".text"))) {
+		return 16;
+	} else if (sv_eq(section->name, sv_str(".data"))) {
+		return 4; // todo: double check that this is correct
+	} else {
+		assert(false && "unimplemented");
+	}
+}
+
+uint64_t get_section_ent_size(section_t *section) {
+	if (sv_eq(section->name, sv_str(".text"))) {
+		return 0;
+	} else if (sv_eq(section->name, sv_str(".data"))) {
+		return 0;
+	} else {
+		assert(false && "unimplemented");
+	}
+}
+
+section_t *find_section(list_t *sections, sv_t name) {
+	for (size_t i = 0; i < sections->size; i++) {
+		section_t *section = sections->data[i];
+		if (sv_eq(section->name, name)) {
+			return section;
+		}
+	}
+
+	return NULL;
+}
+
+section_t *find_section_by_elf_index(list_t *sections, uint32_t index) {
+	for (size_t i = 0; i < sections->size; i++) {
+		section_t *section = sections->data[i];
+
+		if (section->index == index) {
+			return section;
+		}
+	}
+
+	return NULL;
+}
+
+bool is_rela(section_t *section) {
+	// TODO: Store type in section and check type here
+	return startswith(section->name, sv_str(".rela"));
+}
+
+bb_t *create_elf(list_t *sections, list_t *labels, list_t *patches) {
 	bb_t *elf = bb_new(4096);
 
 	// ELF header
@@ -465,43 +564,53 @@ bb_t *create_elf(bb_t *code, list_t *exports, list_t *patches) {
 		0
 	);
 
-	// Text section
-	uint32_t text_index = *section_header_entry_count;
+	// Accumulate sections and create headers
+	for (size_t i = 0; i < sections->size; i++) {
+		section_t *s = sections->data[i];
 
-	uint32_t *text_name_offset;
-	uint64_t *text_data_offset;
-	uint64_t *text_data_size;
-	create_elf_section(elf, section_header_entry_count,
-		&text_name_offset,
-		SHT_PROGBITS,
-		SHF_EXECINSTR | SHF_ALLOC,
-		0,
-		&text_data_offset,
-		&text_data_size,
-		(uint32_t **)&zero,
-		(uint32_t **)&zero,
-		16,
-		0
-	);
+		s->rela_created = false;
 
-	// Shstrtab section
-	*section_header_shstrtab_index = *section_header_entry_count;
+		if (s->index != 0) {
+			continue;
+		}
 
-	uint32_t *shstrtab_name_offset;
-	uint64_t *shstrtab_data_offset;
-	uint64_t *shstrtab_data_size;
-	create_elf_section(elf, section_header_entry_count,
-		&shstrtab_name_offset,
-		SHT_STRTAB,
-		0,
-		0,
-		&shstrtab_data_offset,
-		&shstrtab_data_size,
-		(uint32_t **)&zero,
-		(uint32_t **)&zero,
-		1,
-		0
-	);
+		// Section header
+		s->index = *section_header_entry_count;
+		create_elf_section(elf, section_header_entry_count,
+			&s->name_offset,
+			get_section_type(s),
+			get_section_flags(s),
+			get_section_vaddr(s),
+			&s->data_offset,
+			&s->data_size,
+			&s->link,
+			&s->info,
+			get_section_align(s),
+			get_section_ent_size(s)
+		);
+
+		// Section data
+		bb_t *data = bb_new(4096);
+
+		for (size_t j = 0; j < sections->size; j++) {
+			section_t *section = sections->data[j];
+			if (!sv_eq(s->name, section->name)) {
+				continue;
+			}
+
+			bb_add(data, section->bytes->data, section->bytes->size);
+			bb_free(section->bytes);
+			section->bytes = NULL;
+		}
+
+		s->bytes = data;
+	}
+
+	section_t *text = find_section(sections, sv_str(".text"));
+	if (!text) {
+		fprintf(stderr, "No text section\n");
+		exit(1);
+	}
 
 	// Symtab section
 	uint32_t symtab_index = *section_header_entry_count;
@@ -542,31 +651,102 @@ bb_t *create_elf(bb_t *code, list_t *exports, list_t *patches) {
 		0
 	);
 
-	// Rela.text section
-	uint32_t *rela_text_name_offset;
-	uint64_t *rela_text_data_offset;
-	uint64_t *rela_text_data_size;
-	uint32_t *rela_text_link;
-	uint32_t *rela_text_info;
+	// Create rela sections
+	size_t non_rela_sections_count = sections->size;
+	for (size_t i = 0; i < non_rela_sections_count; i++) {
+		section_t *section = sections->data[i];
+
+		// Create rela if needed
+		bool requires_rela = false;
+		for (size_t i = 0; i < patches->size; i++) {
+			patch_t *patch = patches->data[i];
+			label_t *label = patch->label;
+
+			if (sv_eq(label->section->name, section->name)) {
+				requires_rela = true;
+				break;
+			}
+		}
+
+		if (!requires_rela || section->rela_created) {
+			continue;
+		}
+		section->rela_created = true;
+
+		char *buf = malloc(64);
+		sprintf(buf, ".rela"SV_FMT, SV_ARG(section->name));  // TODO: Bound check
+
+		section_t rela_section = {
+			.bytes = bb_new(4096),
+			.name = sv_str(buf),
+		};
+
+		rela_section.index = *section_header_entry_count;
+		create_elf_section(elf, section_header_entry_count,
+			&rela_section.name_offset,
+			SHT_RELA,
+			0,
+			0,
+			&rela_section.data_offset,
+			&rela_section.data_size,
+			&rela_section.link,
+			&rela_section.info,
+			8,
+			RELA_ENT_SIZE
+		);
+
+		*rela_section.link = symtab_index;
+		*rela_section.info = section->index;
+
+		list_push(sections, heapify(&rela_section, sizeof(rela_section)));
+	}
+
+	uint32_t text_index = text->index;
+
+	// Shstrtab section
+	*section_header_shstrtab_index = *section_header_entry_count;
+
+	uint32_t *shstrtab_name_offset;
+	uint64_t *shstrtab_data_offset;
+	uint64_t *shstrtab_data_size;
 	create_elf_section(elf, section_header_entry_count,
-		&rela_text_name_offset,
-		SHT_RELA,
+		&shstrtab_name_offset,
+		SHT_STRTAB,
 		0,
 		0,
-		&rela_text_data_offset,
-		&rela_text_data_size,
-		&rela_text_link,
-		&rela_text_info,
-		8,
-		RELA_ENT_SIZE
+		&shstrtab_data_offset,
+		&shstrtab_data_size,
+		(uint32_t **)&zero,
+		(uint32_t **)&zero,
+		1,
+		0
 	);
 
-	// Section data
-	//// Text data
-	*text_data_offset = elf->size;
-	*text_data_size = code->size;
-	bb_add(elf, code->data, code->size);
+	// Rela sections
+	// for (size_t i = 0; i < labels->size; i++) {
+	// 	label_t *label = labels->data[i];
+	// 	get_or_create_section();
 
+	// 	uint32_t *rela_text_name_offset;
+	// 	uint64_t *rela_text_data_offset;
+	// 	uint64_t *rela_text_data_size;
+	// 	uint32_t *rela_text_link;
+	// 	uint32_t *rela_text_info;
+	// 	create_elf_section(elf, section_header_entry_count,
+	// 		&rela_text_name_offset,
+	// 		SHT_RELA,
+	// 		0,
+	// 		0,
+	// 		&rela_text_data_offset,
+	// 		&rela_text_data_size,
+	// 		&rela_text_link,
+	// 		&rela_text_info,
+	// 		8,
+	// 		RELA_ENT_SIZE
+	// 	);
+	// }
+
+	// Section data
 	//// Shstrtab data
 	*shstrtab_data_offset = elf->size;
 	bb_add_u8(elf, 0);
@@ -575,9 +755,13 @@ bb_t *create_elf(bb_t *code, list_t *exports, list_t *patches) {
 	bb_add_str(elf, ".shstrtab");
 	bb_add_u8(elf, 0);
 
-	*text_name_offset = elf->size - *shstrtab_data_offset;
-	bb_add_str(elf, ".text");
-	bb_add_u8(elf, 0);
+	for (size_t i = 0; i < sections->size; i++) {
+		section_t *section = sections->data[i];
+
+		*section->name_offset = elf->size - *shstrtab_data_offset;
+		bb_add(elf, section->name.data, section->name.size);
+		bb_add_u8(elf, 0);
+	}
 
 	*strtab_name_offset = elf->size - *shstrtab_data_offset;
 	bb_add_str(elf, ".strtab");
@@ -587,9 +771,9 @@ bb_t *create_elf(bb_t *code, list_t *exports, list_t *patches) {
 	bb_add_str(elf, ".symtab");
 	bb_add_u8(elf, 0);
 
-	*rela_text_name_offset = elf->size - *shstrtab_data_offset;
-	bb_add_str(elf, ".rela.text");
-	bb_add_u8(elf, 0);
+	// *rela_text_name_offset = elf->size - *shstrtab_data_offset;
+	// bb_add_str(elf, ".rela.text");
+	// bb_add_u8(elf, 0);
 
 	*shstrtab_data_size = elf->size - *shstrtab_data_offset;
 
@@ -598,11 +782,11 @@ bb_t *create_elf(bb_t *code, list_t *exports, list_t *patches) {
 	bb_add_u8(strtab_data, 0);
 
 	*symtab_data_offset = elf->size;
-	*symtab_data_size = exports->size * SYMTAB_ENT_SIZE;
+	*symtab_data_size = labels->size * SYMTAB_ENT_SIZE;
 	*symtab_link = strtab_index;
 
-	for (size_t i = 0; i < exports->size; i++) {
-		label_t *label = exports->data[i];
+	for (size_t i = 0; i < labels->size; i++) {
+		label_t *label = labels->data[i];
 		assert(label != NULL);
 
 		label->symbol_index = i;
@@ -628,6 +812,31 @@ bb_t *create_elf(bb_t *code, list_t *exports, list_t *patches) {
 		bb_add_u64(elf, label->end_address - label->address);
 	}
 
+	//// Relas data
+	for (size_t i = 0; i < sections->size; i++) {
+		section_t *rela_section = sections->data[i];
+		if (!is_rela(rela_section)) {
+			continue;
+		}
+
+		section_t *section = find_section_by_elf_index(sections, *rela_section->info);
+		assert(section != NULL);
+
+		rela_section->bytes = bb_new(4096);
+		assert(rela_section->bytes != NULL);
+
+		for (size_t j = 0; j < patches->size; j++) {
+			patch_t *patch = patches->data[j];
+			if (!sv_eq(patch->label->section->name, section->name)) {
+				continue;
+			}
+
+			bb_add_u64(rela_section->bytes, patch->offset);
+			bb_add_u64(rela_section->bytes, (patch->label->symbol_index << 32) | R_X86_64_64);
+			bb_add_u64(rela_section->bytes, 0);
+		}
+	}
+
 	//// Strtab data
 	*strtab_data_offset = elf->size;
 	*strtab_data_size = strtab_data->size;
@@ -635,24 +844,33 @@ bb_t *create_elf(bb_t *code, list_t *exports, list_t *patches) {
 	bb_free(strtab_data);
 
 	//// Rela.text data
-	*rela_text_link = symtab_index;
-	*rela_text_info = text_index;
+	// *rela_text_link = symtab_index;
+	// *rela_text_info = text_index;
 
-	bb_t *rela_text_data = bb_new(4096);
-	assert(rela_text_data != NULL);
+	// bb_t *rela_text_data = bb_new(4096);
+	// assert(rela_text_data != NULL);
 
-	for (size_t i = 0; i < patches->size; i++) {
-		patch_t *patch = patches->data[i];
+	// for (size_t i = 0; i < patches->size; i++) {
+	// 	patch_t *patch = patches->data[i];
 
-		bb_add_u64(rela_text_data, patch->offset);
-		bb_add_u64(rela_text_data, (patch->label->symbol_index << 32) | R_X86_64_64);
-		bb_add_u64(rela_text_data, 0);
+	// 	bb_add_u64(rela_text_data, patch->offset);
+	// 	bb_add_u64(rela_text_data, (patch->label->symbol_index << 32) | R_X86_64_64);
+	// 	bb_add_u64(rela_text_data, 0);
+	// }
+
+	// *rela_text_data_offset = elf->size;
+	// *rela_text_data_size = rela_text_data->size;
+	// bb_add(elf, rela_text_data->data, rela_text_data->size);
+	// bb_free(rela_text_data);
+
+	//// Sections
+	for (size_t i = 0; i < sections->size; i++) {
+		section_t *section = sections->data[i];
+
+		*section->data_size = section->bytes->size;
+		*section->data_offset = elf->size;
+		bb_add(elf, section->bytes->data, section->bytes->size);
 	}
-
-	*rela_text_data_offset = elf->size;
-	*rela_text_data_size = rela_text_data->size;
-	bb_add(elf, rela_text_data->data, rela_text_data->size);
-	bb_free(rela_text_data);
 
 	return elf;
 }
@@ -1025,6 +1243,28 @@ bool parse_expr(tk_t *tk, expr_t *expr, list_t *labels) {
 	return false;
 }
 
+bool section_eq(section_t *a, section_t *b) {
+	return sv_eq(a->name, b->name);
+}
+
+void set_section(section_t **active_section, list_t *sections, sv_t section_name) {
+	section_t key = {
+		.name = section_name,
+	};
+
+	section_t *section = list_find(sections, &key, (eq_func_t)section_eq);
+	if (!section) {
+		section_t sect = {0};
+		sect.name = section_name;
+		sect.bytes = bb_new(4096);
+		assert(sect.bytes != NULL);
+		section = heapify(&sect, sizeof(sect));
+		list_push(sections, section);
+	}
+
+	*active_section = section;
+}
+
 void assemble_ret(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
 	(void)patches;
 	(void)labels;
@@ -1152,12 +1392,8 @@ void assemble_xor(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
 	}
 }
 
-bool try_assemble_label(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
+bool try_assemble_label(section_t *active_section, list_t *labels, tk_t *tk) {
 	tk_t tk_before = *tk;
-
-	(void)code;
-	(void)patches;
-	(void)labels;
 
 	// consume name
 	sv_t name = tk->as.ident;
@@ -1171,7 +1407,8 @@ bool try_assemble_label(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
 	label_t *label = list_find(labels, &name, (eq_func_t)label_eq);
 	assert(label != NULL);
 
-	label->address = code->size;
+	label->section = active_section;
+	label->address = active_section->bytes->size;
 
 	// consume colon
 	tk_next(tk);
@@ -1221,8 +1458,7 @@ void parse_bytes(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
 	expect_type(tk, TK_RPAR);
 }
 
-void parse_section(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
-	(void)code;
+void parse_section(section_t **active_section, list_t *sections, list_t *patches, list_t *labels, tk_t *tk) {
 	(void)patches;
 	(void)labels;
 
@@ -1232,12 +1468,13 @@ void parse_section(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
 	expect_type(tk, TK_LPAR);
 
 	sv_t section_name = expect_type(tk, TK_STRING).as.string;
-	printf("section '"SV_FMT"'\n", SV_ARG(section_name));
 
 	expect_type(tk, TK_RPAR);
+
+	set_section(active_section, sections, section_name);
 }
 
-void parse_directive(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
+void parse_directive(section_t **active_section, list_t *sections, list_t *patches, list_t *labels, tk_t *tk) {
 	// consume at
 	tk_next(tk);
 
@@ -1247,16 +1484,22 @@ void parse_directive(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
 	}
 
 	if (sv_eq(tk->as.ident, sv_str("bytes"))) {
-		parse_bytes(code, patches, labels, tk);
+		parse_bytes((*active_section)->bytes, patches, labels, tk);
 	} else if (sv_eq(tk->as.ident, sv_str("section"))) {
-		parse_section(code, patches, labels, tk);
+		parse_section(active_section, sections, patches, labels, tk);
 	} else {
 		fprintf(stderr, "%s: Unknown directive '"SV_FMT"'\n", tk_pos(*tk), SV_ARG(tk->as.ident));
 		exit(1);
 	}
 }
 
-void assemble(bb_t *code, list_t *patches, list_t *labels, const char *source_path, const char *source_str) {
+list_t *assemble(list_t *patches, list_t *labels, const char *source_path, const char *source_str) {
+	list_t *sections = list_new();
+	assert(sections != NULL);
+
+	section_t *active_section = NULL;
+	set_section(&active_section, sections, sv_str(".text"));
+
 	tk_t tk;
 	tk_init(&tk, source_path, sv_str(source_str));
 	tk_next(&tk);
@@ -1269,7 +1512,7 @@ void assemble(bb_t *code, list_t *patches, list_t *labels, const char *source_pa
 		}
 
 		if (tk.type == TK_AT) {
-			parse_directive(code, patches, labels, &tk);
+			parse_directive(&active_section, sections, patches, labels, &tk);
 			continue;
 		}
 
@@ -1280,7 +1523,7 @@ void assemble(bb_t *code, list_t *patches, list_t *labels, const char *source_pa
 
 		const char *start_pos = tk_pos(tk);
 
-		if (try_assemble_label(code, patches, labels, &tk)) {
+		if (try_assemble_label(active_section, labels, &tk)) {
 			continue;
 		}
 
@@ -1288,6 +1531,7 @@ void assemble(bb_t *code, list_t *patches, list_t *labels, const char *source_pa
 		sv_t ident = tk.as.ident;
 		tk_next(&tk);
 
+		bb_t *code = (*active_section).bytes;
 		if (sv_eq(ident, sv_str("ret"))) {
 			assemble_ret(code, patches, labels, &tk);
 		} else if (sv_eq(ident, sv_str("mov"))) {
@@ -1302,6 +1546,8 @@ void assemble(bb_t *code, list_t *patches, list_t *labels, const char *source_pa
 			exit(1);
 		}
 	}
+
+	return sections;
 }
 
 int main(int argc, char *argv[]) {
@@ -1322,13 +1568,11 @@ int main(int argc, char *argv[]) {
 	get_labels(labels, source_path, source_str);
 
 	// Second pass, assemble instructions
-	bb_t *code = bb_new(4096);
-	assert(code != NULL);
-
 	list_t *patches = list_new();
 	assert(patches != NULL);
 
-	assemble(code, patches, labels, source_path, source_str);
+	list_t *sections = assemble(patches, labels, source_path, source_str);
+	assert(sections != NULL);
 
 	// Apply patches
 	// for (size_t i = 0; i < patches->size; i++) {
@@ -1339,17 +1583,17 @@ int main(int argc, char *argv[]) {
 	for (size_t i = 0; i < labels->size; i++) {
 		label_t *label = labels->data[i];
 		assert(label != NULL);
-		label->end_address = code->size;
+		label->end_address = label->section->bytes->size;
 		if (i > 0) {
 			((label_t *)labels->data[i - 1])->end_address = label->address;
 		}
 	}
 
-	bb_t *elf = create_elf(code, labels, patches);
+	bb_t *elf = create_elf(sections, labels, patches);
 	assert(write_file("out.o", elf->data, elf->size));
 
 	list_free(labels, NULL);
-	bb_free(code);
+	list_free(sections, (free_func_t)section_free);
 	bb_free(elf);
 	free((char *)source_str);
 	return 0;

@@ -1,4 +1,7 @@
 @section(".text")
+; section .text
+; global do_nothing
+; global msg
 do_nothing:
 	; Write to stdout
 	mov rax, 1 ; syscall number for sys_write
@@ -14,5 +17,7 @@ do_nothing:
 	ret
 
 @section(".data")
+; section .data
 msg:
 	@bytes(104, 101, 121, 10)
+	; db 104, 101, 121, 10
