@@ -165,6 +165,13 @@ bool write_file(const char *path, const void *data, size_t size) {
 	return true;
 }
 
+sv_t sv_str(const char *str) {
+	return (sv_t) {
+		.data = (char *)str,
+		.size = strlen(str),
+	};
+}
+
 /// @brief Chops a token from the string.
 /// @param string The string to chop from. The delimiter will be removed.
 /// @param delim A string containing delimiter characters.
@@ -296,6 +303,30 @@ bool chop_ident(sv_t *sv, sv_t *ident) {
 	return true;
 }
 
+bool chop_string(sv_t *sv, sv_t *string) {
+	if (!chop_start(sv, sv_str("\""))) {
+		return false;
+	}
+
+	size_t i = 0;
+	while (i < sv->size && sv->data[i] != '"') {
+		i++;
+	}
+	if (i >= sv->size) {
+		fprintf(stderr, "Unclosed string\n");
+		exit(1);
+	}
+	i++;
+
+	*string = (sv_t) {
+		.data = sv->data,
+		.size = i - 1
+	};
+	sv->data += i;
+	sv->size -= i;
+	return true;
+}
+
 bool chop_u64(sv_t *string, uint64_t *value) {
 	char *end;
 	*value = strtoull(string->data, &end, 0);
@@ -308,13 +339,6 @@ bool chop_u64(sv_t *string, uint64_t *value) {
 	string->size -= end - string->data;
 	string->data = end;
 	return true;
-}
-
-sv_t sv_str(const char *str) {
-	return (sv_t) {
-		.data = (char *)str,
-		.size = strlen(str),
-	};
 }
 
 bool sv_eq(sv_t a, sv_t b) {
@@ -812,6 +836,7 @@ typedef enum {
 	TK_RPAR,
 	TK_COLON,
 	TK_NEWLINE,
+	TK_STRING,
 } tk_type_t;
 
 typedef struct {
@@ -822,6 +847,7 @@ typedef struct {
 	union {
 		sv_t ident;
 		int64_t number;
+		sv_t string;
 	} as;
 } tk_t;
 
@@ -842,7 +868,7 @@ const char *tk_pos(tk_t tk) {
 
 const char *tk_name(tk_type_t type) {
 	switch (type) {
-	case TK_AT: return "at";
+	case TK_AT: return "at symbol";
 	case TK_COLON: return "colon";
 	case TK_COMMA: return "comma";
 	case TK_EOF: return "end of file";
@@ -852,6 +878,7 @@ const char *tk_name(tk_type_t type) {
 	case TK_NUMBER: return "number";
 	case TK_RPAR: return "right parenthesis";
 	case TK_UNKNOWN: return "unknown";
+	case TK_STRING: return "string";
 	}
 	assert(false && "unreachable");
 }
@@ -869,6 +896,9 @@ bool tk_next(tk_t *tk) {
 		return true;
 	} else if (chop_ident(&tk->source, &tk->as.ident)) {
 		tk->type = TK_IDENT;
+		return true;
+	} else if (chop_string(&tk->source, &tk->as.string)) {
+		tk->type = TK_STRING;
 		return true;
 	} else if (chop_start(&tk->source, sv_str(":"))) {
 		tk->type = TK_COLON;
@@ -1148,6 +1178,16 @@ bool try_assemble_label(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
 	return true;
 }
 
+tk_t expect_type(tk_t *tk, tk_type_t type) {
+	if (tk->type != type) {
+		fprintf(stderr, "%s: Expected '%s'\n", tk_pos(*tk), tk_name(type));
+		exit(1);
+	}
+	tk_t res = *tk;
+	tk_next(tk);
+	return res;
+}
+
 void parse_bytes(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
 	(void)patches;
 	(void)labels;
@@ -1155,12 +1195,7 @@ void parse_bytes(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
 	// consume "bytes"
 	tk_next(tk);
 
-	if (tk->type != TK_LPAR) {
-		fprintf(stderr, "%s: Expected '(' after @bytes\n", tk_pos(*tk));
-		exit(1);
-	}
-	// consume '('
-	tk_next(tk);
+	expect_type(tk, TK_LPAR);
 
 	// consume multiple numbers
 	while (tk->type != TK_RPAR) {
@@ -1183,8 +1218,23 @@ void parse_bytes(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
 		}
 	}
 
-	// consume ')'
+	expect_type(tk, TK_RPAR);
+}
+
+void parse_section(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
+	(void)code;
+	(void)patches;
+	(void)labels;
+
+	// consume 'section'
 	tk_next(tk);
+
+	expect_type(tk, TK_LPAR);
+
+	sv_t section_name = expect_type(tk, TK_STRING).as.string;
+	printf("section '"SV_FMT"'\n", SV_ARG(section_name));
+
+	expect_type(tk, TK_RPAR);
 }
 
 void parse_directive(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
@@ -1198,8 +1248,10 @@ void parse_directive(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
 
 	if (sv_eq(tk->as.ident, sv_str("bytes"))) {
 		parse_bytes(code, patches, labels, tk);
+	} else if (sv_eq(tk->as.ident, sv_str("section"))) {
+		parse_section(code, patches, labels, tk);
 	} else {
-		fprintf(stderr, "%s: Unknown directive %s\n", tk_pos(*tk), tk->as.ident.data);
+		fprintf(stderr, "%s: Unknown directive '"SV_FMT"'\n", tk_pos(*tk), SV_ARG(tk->as.ident));
 		exit(1);
 	}
 }
