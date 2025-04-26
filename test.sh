@@ -10,5 +10,5 @@ make lasm
 cc -o test test.c out.o
 
 # Run
-rm *.o
+# rm *.o
 ./test

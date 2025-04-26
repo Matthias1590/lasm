@@ -1,0 +1,7 @@
+xor rdi, rdi
+; rax, rax = 0x48 0x31 0b11000000
+; rax, rdi = 0x48 0x31 0b11111000
+; rax, rsi = 0x48 0x31 0b11110000
+; rax, rdx = 0x48 0x31 0b11010000
+; rdi, rax = 0x48 0x31 0b11000111
+; rdi, rsi = 0x48 0x31 0b11110111
