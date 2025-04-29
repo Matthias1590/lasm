@@ -100,5 +100,5 @@ enum {
 typedef struct {
     offset_t offset;
     uint64_t index_and_type;
-    uint64_t addend;
+    int64_t addend;
 } elf_rela_t;

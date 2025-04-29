@@ -1,7 +1,4 @@
 @section(".text")
-; section .text
-; global do_nothing
-; global msg
 do_nothing:
 	; Write to stdout
 	mov rax, 1 ; syscall number for sys_write
@@ -10,14 +7,16 @@ do_nothing:
 	mov rdx, 4 ; number of bytes to write
 	syscall
 
+	call do_exit
+
+@section(".data")
+msg:
+	@ascii("hey\n")
+
+@section(".text")
+do_exit:
 	; Exit program
 	mov rax, 60 ; syscall number for sys_exit
 	xor rdi, rdi ; exit code 0
 	syscall
 	ret
-
-@section(".data")
-; section .data
-msg:
-	@bytes(104, 101, 121, 10)
-	; db 104, 101, 121, 10

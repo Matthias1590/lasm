@@ -166,9 +166,45 @@ bool chop_string(sv_t *sv, sv_t *string) {
 		return false;
 	}
 
-	size_t i = 0;
-	while (i < sv->size && sv->data[i] != '"') {
-		i++;
+	char *new_string = malloc(sv->size + 1);  // TODO: Bound check? Also never freed
+
+	bool escape = false;
+	size_t j = 0;
+	size_t i;
+	for (i = 0; i < sv->size; i++) {
+		if (escape) {
+			switch (sv->data[i]) {
+				case 'n':
+					new_string[j++] = '\n';
+					break;
+				case 't':
+					new_string[j++] = '\t';
+					break;
+				case 'r':
+					new_string[j++] = '\r';
+					break;
+				case 'b':
+					new_string[j++] = '\b';
+					break;
+				case 'f':
+					new_string[j++] = '\f';
+					break;
+				case 'v':
+					new_string[j++] = '\v';
+					break;
+				default:
+					new_string[j++] = sv->data[i];
+			}
+			escape = false;
+		} else {
+			if (sv->data[i] == '\\') {
+				escape = true;
+				continue;
+			} else if (sv->data[i] == '\"') {
+				break;
+			}
+			new_string[j++] = sv->data[i];
+		}
 	}
 	if (i >= sv->size) {
 		fprintf(stderr, "Unclosed string\n");
@@ -176,10 +212,12 @@ bool chop_string(sv_t *sv, sv_t *string) {
 	}
 	i++;
 
+	new_string[j] = '\0';
 	*string = (sv_t) {
-		.data = sv->data,
-		.size = i - 1
+		.data = new_string,
+		.size = strlen(new_string),
 	};
+
 	sv->data += i;
 	sv->size -= i;
 	return true;
@@ -530,8 +568,8 @@ bb_t *create_elf(sections_t user_sections) {
 
 			written_init(&relocation->elf_rela, rela->data);
 			relocation->elf_rela.data.offset = relocation->patch_offset;
-			relocation->elf_rela.data.index_and_type = (symbol->index << 32) | R_X86_64_64;
-			relocation->elf_rela.data.addend = 0;
+			relocation->elf_rela.data.index_and_type = (symbol->index << 32) | relocation->patch_type;
+			relocation->elf_rela.data.addend = relocation->address_offset;
 		}
 	}
 
@@ -597,7 +635,7 @@ bb_t *create_elf(sections_t user_sections) {
 		section->elf_sh.data.data_size = section->data->size;
 		bb_add(elf, section->data->data, section->data->size);
 	}
-	
+
 	// Update headers
 	for (size_t i = 0; i < sections.count; i++) {
 		section_t *section = list_at(&sections, i);
@@ -1014,6 +1052,39 @@ void assemble_syscall(bb_t *code, relocations_t *relocations, tk_t *tk) {
 	}
 }
 
+void assemble_call(bb_t *code, relocations_t *relocations, tk_t *tk) {
+
+	expr_t *target = expr_new();
+	if (!parse_expr(tk, target)) {
+		fprintf(stderr, "Expected target operand\n");
+		exit(1);
+	}
+
+	switch (target->type) {
+	case EXPR_LABEL: {
+		bb_add_u8(code, 0xe8);
+
+		relocation_t relocation = {
+			.patch_offset = bb_add_u32(code, 0),
+			.patch_type = R_X86_64_PC32,
+			.address_offset = -4,
+			.symbol_name = target->as.label,
+		};
+		list_push(relocations, heapify(relocation_t, &relocation));
+	} break;
+	default: {
+		fprintf(stderr, "Unhandled target type %s\n", expr_name(target->type));
+		exit(1);
+	} break;
+	}
+
+	// expect newline
+	if (tk->type != TK_NEWLINE) {
+		fprintf(stderr, "Expected newline after call instruction\n");
+		exit(1);
+	}
+}
+
 void assemble_mov(bb_t *code, relocations_t *relocations, tk_t *tk) {
 	expr_t *dest = expr_new();
 	if (!parse_expr(tk, dest)) {
@@ -1040,7 +1111,6 @@ void assemble_mov(bb_t *code, relocations_t *relocations, tk_t *tk) {
 		case RAX: bb_add_u8(code, 0xb8); break;
 		case RDX: bb_add_u8(code, 0xba); break;
 		case RSP: bb_add_u8(code, 0xbc); break;
-		case RIP: bb_add_u8(code, 0xbc); break;
 		case RSI: bb_add_u8(code, 0xbe); break;
 		case RDI: bb_add_u8(code, 0xbf); break;
 		default: assert(false && "unhandled");
@@ -1052,6 +1122,8 @@ void assemble_mov(bb_t *code, relocations_t *relocations, tk_t *tk) {
 		case EXPR_LABEL: {
 			relocation_t relocation = {
 				.patch_offset = bb_add_u64(code, 0),
+				.patch_type = R_X86_64_64,
+				.address_offset = 0,
 				.symbol_name = src->as.label,
 			};
 			list_push(relocations, heapify(relocation_t, &relocation));
@@ -1181,6 +1253,24 @@ void parse_bytes(bb_t *code, relocations_t *relocations, symbols_t *symbols, tk_
 	expect_type(tk, TK_RPAR);
 }
 
+void parse_ascii(bb_t *code, relocations_t *relocations, symbols_t *symbols, tk_t *tk) {
+	(void)relocations;
+	(void)symbols;
+
+	// consume "ascii"
+	tk_next(tk);
+
+	expect_type(tk, TK_LPAR);
+
+	tk_t string = expect_type(tk, TK_STRING);
+
+	for (size_t i = 0; i < string.as.string.size; i++) {
+		bb_add_u8(code, string.as.string.data[i]);
+	}
+
+	expect_type(tk, TK_RPAR);
+}
+
 void parse_section(section_t **active_section, sections_t *sections, relocations_t *relocations, symbols_t *symbols, tk_t *tk) {
 	(void)relocations;
 	(void)symbols;
@@ -1208,6 +1298,8 @@ void parse_directive(section_t **active_section, sections_t *sections, relocatio
 
 	if (sv_eq(tk->as.ident, sv_str("bytes"))) {
 		parse_bytes((*active_section)->data, relocations, symbols, tk);
+	} else if (sv_eq(tk->as.ident, sv_str("ascii"))) {
+		parse_ascii((*active_section)->data, relocations, symbols, tk);
 	} else if (sv_eq(tk->as.ident, sv_str("section"))) {
 		parse_section(active_section, sections, relocations, symbols, tk);
 	} else {
@@ -1253,6 +1345,7 @@ sections_t assemble(const char *source_path, const char *source_str) {
 		sv_t ident = tk.as.ident;
 		tk_next(&tk);
 
+		// TODO: Error location reporting is just plain wrong for some reason, unexpected tokens also have weird error messages
 		bb_t *code = (*active_section).data;
 		relocations_t *relocations = &(*active_section).relocations;
 		if (sv_eq(ident, sv_str("ret"))) {
@@ -1263,6 +1356,8 @@ sections_t assemble(const char *source_path, const char *source_str) {
 			assemble_xor(code, relocations, &tk);
 		} else if (sv_eq(ident, sv_str("syscall"))) {
 			assemble_syscall(code, relocations, &tk);
+		} else if (sv_eq(ident, sv_str("call"))) {
+			assemble_call(code, relocations, &tk);
 		} else {
 			// error, expected a label
 			fprintf(stderr, "%s: Expected label or instruction\n", start_pos);
