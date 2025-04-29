@@ -75,56 +75,10 @@ typedef struct {
 } sv_t;
 
 typedef struct {
-	sv_t name;
-	bb_t *bytes;
-	uint32_t index;
-	uint32_t *name_offset;
-	uint64_t *data_offset;
-	uint64_t *data_size;
-	uint32_t *link;
-	uint32_t *info;
-	bool rela_created;
-} section_t;
-
-void section_free(section_t *section) {
-	bb_free(section->bytes);
-	free(section);
-}
-
-typedef struct {
-	sv_t name;
-	size_t address;
-	size_t end_address;
-	size_t symbol_index;
-	section_t *section;
-} label_t;
-
-typedef struct {
-	size_t offset;
-	label_t *label;
-} patch_t;
-
-typedef struct {
 	void **data;
 	size_t size;
 	size_t capacity;
 } list_t;
-
-list_t *list_new(void) {
-	list_t *list = malloc(sizeof(list_t));
-	assert(list != NULL);
-	memset(list, 0, sizeof(list_t));
-	return list;
-}
-
-void list_push(list_t *list, void *value) {
-	if (list->size == list->capacity) {
-		list->capacity = list->capacity == 0 ? 1 : list->capacity * 2;
-		list->data = realloc(list->data, list->capacity * sizeof(void *));
-		assert(list->data != NULL);
-	}
-	list->data[list->size++] = value;
-}
 
 typedef void (*free_func_t)(void *);
 
@@ -140,6 +94,68 @@ void list_free(list_t *list, free_func_t free_func) {
 	}
 	free(list->data);
 	free(list);
+}
+
+typedef struct {
+	sv_t name;
+	bb_t *data;
+	list_t *labels;
+	list_t *patches;
+	bool merged;
+	uint32_t name_offset;
+	// Elf fields
+	uint32_t type;
+	uint64_t flags;
+	uint32_t link;
+	uint32_t info;
+	uint64_t align;
+	// Elf section header index
+	uint32_t index_in_sh_table;
+	// Elf patch pointers
+	uint32_t *patch_name_offset;
+	uint64_t *patch_virtual_addr;
+	uint64_t *patch_data_offset;
+	uint64_t *patch_data_size;
+	uint32_t *patch_link;
+	uint32_t *patch_info;
+	uint64_t *patch_align;
+	uint64_t *patch_entry_size;
+} section_t;
+
+void section_free(section_t *section) {
+	bb_free(section->data);
+	list_free(section->labels, NULL);
+	free(section);
+}
+
+typedef struct {
+	sv_t name;
+	sv_t section_name;
+	uint64_t address;
+	uint64_t end_address;
+	size_t symbol_index;
+} label_t;
+
+typedef struct {
+	uint64_t *patch_address;
+	sv_t label_name;
+} patch_t;
+
+list_t *list_new(void) {
+	list_t *list = malloc(sizeof(list_t));
+	assert(list != NULL);
+	memset(list, 0, sizeof(list_t));
+	return list;
+}
+
+void *list_push(list_t *list, void *value) {
+	if (list->size == list->capacity) {
+		list->capacity = list->capacity == 0 ? 1 : list->capacity * 2;
+		list->data = realloc(list->data, list->capacity * sizeof(void *));
+		assert(list->data != NULL);
+	}
+	list->data[list->size++] = value;
+	return value;
 }
 
 /// @brief Prints usage of the program.
@@ -406,6 +422,7 @@ void *list_find(list_t *list, void *key, eq_func_t eq) {
 #define SHF_WRITE 0x1
 #define SHF_ALLOC 0x2
 #define SHF_EXECINSTR 0x4
+#define STB_LOCAL 0
 #define STB_GLOBAL 1
 #define STT_FUNC 2
 #define STT_NOTYPE 0
@@ -439,22 +456,88 @@ void create_elf_header(bb_t *elf, uint64_t **section_header_offset, uint16_t **s
 	*section_header_shstrtab_index = bb_add_u16(elf, 0); // Section header string table index
 }
 
-void create_elf_section(bb_t *elf, uint16_t *section_header_entry_count,
-	uint32_t **name_offset, uint32_t type, uint64_t flags, uint64_t virtual_addr,
-	uint64_t **file_offset, uint64_t **size, uint32_t **link, uint32_t **info,
-	uint64_t address_align, uint64_t entry_size
-) {
-	*name_offset = bb_add_u32(elf, 0);
-	bb_add_u32(elf, type);
-	bb_add_u64(elf, flags);
-	bb_add_u64(elf, virtual_addr);
-	*file_offset = bb_add_u64(elf, 0);
-	*size = bb_add_u64(elf, 0);
-	*link = bb_add_u32(elf, 0);
-	*info = bb_add_u32(elf, 0);
-	bb_add_u64(elf, address_align);
-	bb_add_u64(elf, entry_size);
-	(*section_header_entry_count)++;
+/// @brief Writes a null terminated string to a strtab section.
+/// @param section The section to write the string to.
+/// @param string The string to write.
+/// @return The offset of the written string.
+uint32_t section_write_str(section_t *section, sv_t string) {
+	assert(section->type == SHT_STRTAB && "trying to write a string to a non-strtab section");
+
+	if (section->data->size == 0) {
+		bb_add_u8(section->data, 0);
+	}
+	if (string.size == 0) {
+		return 0;
+	}
+
+	uint32_t name_offset = section->data->size;
+
+	bb_add(section->data, string.data, string.size);
+	bb_add_u8(section->data, 0);
+
+	return name_offset;
+}
+
+uint32_t section_write_sym(section_t *symtab, section_t *strtab, sv_t name, uint8_t visibility, uint8_t type, uint16_t section_index, uint64_t address, uint64_t size) {
+	uint32_t symbol_index = symtab->data->size / SYMTAB_ENT_SIZE;
+
+	// Name
+	bb_add_u32(symtab->data, section_write_str(strtab, name));
+
+	// Info
+	bb_add_u8(symtab->data, (visibility << 4) | type);
+
+	// Other
+	bb_add_u8(symtab->data, 0);
+
+	// Section index
+	bb_add_u16(symtab->data, section_index);
+
+	// Value
+	bb_add_u64(symtab->data, address);
+
+	// Size
+	bb_add_u64(symtab->data, size);
+
+	return symbol_index;
+}
+
+void section_write_header(section_t *section, bb_t *elf) {
+	section->patch_name_offset = bb_add_u32(elf, 0);
+	bb_add_u32(elf, section->type);
+	bb_add_u64(elf, section->flags);
+	section->patch_virtual_addr = bb_add_u64(elf, 0);
+	section->patch_data_offset = bb_add_u64(elf, 0);
+	section->patch_data_size = bb_add_u64(elf, 0);
+	section->patch_link = bb_add_u32(elf, 0);
+	section->patch_info = bb_add_u32(elf, 0);
+	section->patch_align = bb_add_u64(elf, 0);
+	section->patch_entry_size = bb_add_u64(elf, 0);
+}
+
+void section_write_data(section_t *section, bb_t *elf) {
+	if (section->type == SHT_NULL) {
+		return;
+	}
+
+	*section->patch_data_offset = elf->size;
+	*section->patch_data_size = section->data->size;
+	bb_add(elf, section->data->data, section->data->size);
+}
+
+section_t *section_new(sv_t name, uint32_t type, uint64_t flags) {
+	section_t section = {0};
+	section.name = name;
+	section.data = bb_new(4096);
+	assert(section.data != NULL);
+	section.labels = list_new();
+	assert(section.labels != NULL);
+	section.patches = list_new();
+	assert(section.patches != NULL);
+	section.type = type;
+	section.flags = flags;
+
+	return heapify(&section, sizeof(section));
 }
 
 // todo: allow for overwriting section type in section directive
@@ -508,6 +591,21 @@ uint64_t get_section_ent_size(section_t *section) {
 	}
 }
 
+label_t *find_label(list_t *sections, sv_t name) {
+	for (size_t i = 0; i < sections->size; i++) {
+		section_t *section = sections->data[i];
+
+		for (size_t j = 0; j < section->labels->size; j++) {
+			label_t *label = section->labels->data[j];
+			if (sv_eq(label->name, name)) {
+				return label;
+			}
+		}
+	}
+
+	return NULL;
+}
+
 section_t *find_section(list_t *sections, sv_t name) {
 	for (size_t i = 0; i < sections->size; i++) {
 		section_t *section = sections->data[i];
@@ -523,7 +621,7 @@ section_t *find_section_by_elf_index(list_t *sections, uint32_t index) {
 	for (size_t i = 0; i < sections->size; i++) {
 		section_t *section = sections->data[i];
 
-		if (section->index == index) {
+		if (section->index_in_sh_table == index) {
 			return section;
 		}
 	}
@@ -531,348 +629,368 @@ section_t *find_section_by_elf_index(list_t *sections, uint32_t index) {
 	return NULL;
 }
 
-bool is_rela(section_t *section) {
-	// TODO: Store type in section and check type here
-	return startswith(section->name, sv_str(".rela"));
+list_t *sections_merge(list_t *sections) {
+	list_t *merged = list_new();
+
+	for (size_t i = 0; i < sections->size; i++) {
+		section_t *s = sections->data[i];
+		s->merged = false;
+	}
+
+	for (size_t i1 = 0; i1 < sections->size; i1++) {
+		section_t *s1 = sections->data[i1];
+		if (s1->merged) {
+			continue;
+		}
+		s1->merged = true;
+		list_push(merged, s1);
+
+		bb_t *new_data = bb_new(4096);
+
+		for (size_t i2 = 0; i2 < sections->size; i2++) {
+			section_t *s2 = sections->data[i2];
+			if (!sv_eq(s1->name, s2->name)) {
+				continue;
+			}
+			s2->merged = true;
+
+			bb_add(new_data, s2->data->data, s2->data->size);
+		}
+	}
+
+	return merged;
 }
 
-bb_t *create_elf(list_t *sections, list_t *labels, list_t *patches) {
+bb_t *create_elf(list_t *user_sections) {
+	user_sections = sections_merge(user_sections);
+
+	list_t *sections = list_new();
+
+	// Hardcoded sections
+	list_push(sections, section_new(sv_str(""), SHT_NULL, 0));  // null section
+	section_t *shstrtab = list_push(sections, section_new(sv_str(".shstrtab"), SHT_STRTAB, 0));
+	section_t *strtab = list_push(sections, section_new(sv_str(".strtab"), SHT_STRTAB, 0));
+	section_t *symtab = list_push(sections, section_new(sv_str(".symtab"), SHT_SYMTAB, 0));
+
+	// Push all user sections to sections list
+	for (size_t i = 0; i < user_sections->size; i++) {
+		list_push(sections, user_sections->data[i]);
+	}
+
+	// Set section indexes
+	for (size_t i = 0; i < sections->size; i++) {
+		section_t *section = sections->data[i];
+		section->index_in_sh_table = i;
+	}
+
+	// Populate symtab
+	section_write_sym(symtab, strtab, sv_str(""), STB_LOCAL, STT_NOTYPE, 0, 0, 0);
+
+	for (size_t i = 0; i < sections->size; i++) {
+		section_t *section = sections->data[i];
+
+		for (size_t j = 0; j < section->labels->size; j++) {
+			label_t *label = section->labels->data[j];
+			assert(label != NULL);
+
+			label->symbol_index = section_write_sym(symtab, strtab, label->name, STB_GLOBAL, STT_NOTYPE, section->index_in_sh_table, label->address, 0);  // TODO: Shoulnd't we set the size? Doesn't seem like nasm does it
+		}
+	}
+
+	// Create rela sections
+	for (size_t i = 0; i < sections->size;i ++) {
+		section_t *section = sections->data[i];
+		if (section->patches->size == 0) {
+			continue;
+		}
+
+		char *buff = malloc(64);
+		sprintf(buff, ".rela"SV_FMT, SV_ARG(section->name));  // TODO: Bound check
+
+		section_t *rela = list_push(sections, section_new(sv_str(buff), SHT_RELA, 0));
+		rela->index_in_sh_table = sections->size - 1;
+		rela->link = 3;  // TODO: Unhardcode, make it so the index is patched
+		rela->info = i;  // TODO: Don't use i for this, have an info union instead
+
+		for (size_t j = 0; j < section->patches->size; j++) {
+			patch_t *patch = section->patches->data[j];
+			label_t *label = find_label(user_sections, patch->label_name);
+			assert(label != NULL);
+
+			bb_add_u64(rela->data, (uintptr_t)patch->patch_address - (uintptr_t)section->data->data);
+			bb_add_u64(rela->data, (label->symbol_index << 32) | R_X86_64_64);
+			bb_add_u64(rela->data, 0);
+		}
+	}
+
+	// Sanity checks
+	if (!find_section(sections, sv_str(".text"))) {
+		fprintf(stderr, "No text section\n");
+		exit(1);
+	}
+
+	// Put all section names in shstrtab
+	for (size_t i = 0; i < sections->size; i++) {
+		section_t *section = sections->data[i];
+
+		section->name_offset = section_write_str(shstrtab, section->name);
+	}
+
+	// Write elf file
 	bb_t *elf = bb_new(4096);
 
-	// ELF header
+	// Elf header
 	uint64_t *section_header_offset;
 	uint16_t *section_header_entry_count;
 	uint16_t *section_header_shstrtab_index;
 	create_elf_header(elf, &section_header_offset, &section_header_entry_count, &section_header_shstrtab_index);
 
-	// Section headers
+	// Headers
 	*section_header_offset = elf->size;
 
-	void *zero;
-
-	// Null section
-	create_elf_section(elf, section_header_entry_count,
-		(uint32_t **)&zero,
-		SHT_NULL,
-		0,
-		0,
-		(uint64_t **)&zero,
-		(uint64_t **)&zero,
-		(uint32_t **)&zero,
-		(uint32_t **)&zero,
-		0,
-		0
-	);
-
-	// Accumulate sections and create headers
-	for (size_t i = 0; i < sections->size; i++) {
-		section_t *s = sections->data[i];
-
-		s->rela_created = false;
-
-		if (s->index != 0) {
-			continue;
-		}
-
-		// Section header
-		s->index = *section_header_entry_count;
-		create_elf_section(elf, section_header_entry_count,
-			&s->name_offset,
-			get_section_type(s),
-			get_section_flags(s),
-			get_section_vaddr(s),
-			&s->data_offset,
-			&s->data_size,
-			&s->link,
-			&s->info,
-			get_section_align(s),
-			get_section_ent_size(s)
-		);
-
-		// Section data
-		bb_t *data = bb_new(4096);
-
-		for (size_t j = 0; j < sections->size; j++) {
-			section_t *section = sections->data[j];
-			if (!sv_eq(s->name, section->name)) {
-				continue;
-			}
-
-			bb_add(data, section->bytes->data, section->bytes->size);
-			bb_free(section->bytes);
-			section->bytes = NULL;
-		}
-
-		s->bytes = data;
-	}
-
-	section_t *text = find_section(sections, sv_str(".text"));
-	if (!text) {
-		fprintf(stderr, "No text section\n");
-		exit(1);
-	}
-
-	// Symtab section
-	uint32_t symtab_index = *section_header_entry_count;
-
-	uint32_t *symtab_name_offset;
-	uint64_t *symtab_data_offset;
-	uint64_t *symtab_data_size;
-	uint32_t *symtab_link;
-	create_elf_section(elf, section_header_entry_count,
-		&symtab_name_offset,
-		SHT_SYMTAB,
-		0,
-		0,
-		&symtab_data_offset,
-		&symtab_data_size,
-		&symtab_link,
-		(uint32_t **)&zero,
-		8,
-		SYMTAB_ENT_SIZE
-	);
-
-	// Strtab section
-	uint32_t strtab_index = *section_header_entry_count;
-
-	uint32_t *strtab_name_offset;
-	uint64_t *strtab_data_offset;
-	uint64_t *strtab_data_size;
-	create_elf_section(elf, section_header_entry_count,
-		&strtab_name_offset,
-		SHT_STRTAB,
-		0,
-		0,
-		&strtab_data_offset,
-		&strtab_data_size,
-		(uint32_t **)&zero,
-		(uint32_t **)&zero,
-		1,
-		0
-	);
-
-	// Create rela sections
-	size_t non_rela_sections_count = sections->size;
-	for (size_t i = 0; i < non_rela_sections_count; i++) {
-		section_t *section = sections->data[i];
-
-		// Create rela if needed
-		bool requires_rela = false;
-		for (size_t i = 0; i < patches->size; i++) {
-			patch_t *patch = patches->data[i];
-			label_t *label = patch->label;
-
-			if (sv_eq(label->section->name, section->name)) {
-				requires_rela = true;
-				break;
-			}
-		}
-
-		if (!requires_rela || section->rela_created) {
-			continue;
-		}
-		section->rela_created = true;
-
-		char *buf = malloc(64);
-		sprintf(buf, ".rela"SV_FMT, SV_ARG(section->name));  // TODO: Bound check
-
-		section_t rela_section = {
-			.bytes = bb_new(4096),
-			.name = sv_str(buf),
-		};
-
-		rela_section.index = *section_header_entry_count;
-		create_elf_section(elf, section_header_entry_count,
-			&rela_section.name_offset,
-			SHT_RELA,
-			0,
-			0,
-			&rela_section.data_offset,
-			&rela_section.data_size,
-			&rela_section.link,
-			&rela_section.info,
-			8,
-			RELA_ENT_SIZE
-		);
-
-		*rela_section.link = symtab_index;
-		*rela_section.info = section->index;
-
-		list_push(sections, heapify(&rela_section, sizeof(rela_section)));
-	}
-
-	uint32_t text_index = text->index;
-
-	// Shstrtab section
-	*section_header_shstrtab_index = *section_header_entry_count;
-
-	uint32_t *shstrtab_name_offset;
-	uint64_t *shstrtab_data_offset;
-	uint64_t *shstrtab_data_size;
-	create_elf_section(elf, section_header_entry_count,
-		&shstrtab_name_offset,
-		SHT_STRTAB,
-		0,
-		0,
-		&shstrtab_data_offset,
-		&shstrtab_data_size,
-		(uint32_t **)&zero,
-		(uint32_t **)&zero,
-		1,
-		0
-	);
-
-	// Rela sections
-	// for (size_t i = 0; i < labels->size; i++) {
-	// 	label_t *label = labels->data[i];
-	// 	get_or_create_section();
-
-	// 	uint32_t *rela_text_name_offset;
-	// 	uint64_t *rela_text_data_offset;
-	// 	uint64_t *rela_text_data_size;
-	// 	uint32_t *rela_text_link;
-	// 	uint32_t *rela_text_info;
-	// 	create_elf_section(elf, section_header_entry_count,
-	// 		&rela_text_name_offset,
-	// 		SHT_RELA,
-	// 		0,
-	// 		0,
-	// 		&rela_text_data_offset,
-	// 		&rela_text_data_size,
-	// 		&rela_text_link,
-	// 		&rela_text_info,
-	// 		8,
-	// 		RELA_ENT_SIZE
-	// 	);
-	// }
-
-	// Section data
-	//// Shstrtab data
-	*shstrtab_data_offset = elf->size;
-	bb_add_u8(elf, 0);
-
-	*shstrtab_name_offset = elf->size - *shstrtab_data_offset;
-	bb_add_str(elf, ".shstrtab");
-	bb_add_u8(elf, 0);
-
 	for (size_t i = 0; i < sections->size; i++) {
 		section_t *section = sections->data[i];
 
-		*section->name_offset = elf->size - *shstrtab_data_offset;
-		bb_add(elf, section->name.data, section->name.size);
-		bb_add_u8(elf, 0);
+		section_write_header(section, elf);
 	}
 
-	*strtab_name_offset = elf->size - *shstrtab_data_offset;
-	bb_add_str(elf, ".strtab");
-	bb_add_u8(elf, 0);
-
-	*symtab_name_offset = elf->size - *shstrtab_data_offset;
-	bb_add_str(elf, ".symtab");
-	bb_add_u8(elf, 0);
-
-	// *rela_text_name_offset = elf->size - *shstrtab_data_offset;
-	// bb_add_str(elf, ".rela.text");
-	// bb_add_u8(elf, 0);
-
-	*shstrtab_data_size = elf->size - *shstrtab_data_offset;
-
-	//// Symtab data
-	bb_t *strtab_data = bb_new(4096);
-	bb_add_u8(strtab_data, 0);
-
-	*symtab_data_offset = elf->size;
-	*symtab_data_size = labels->size * SYMTAB_ENT_SIZE;
-	*symtab_link = strtab_index;
-
-	for (size_t i = 0; i < labels->size; i++) {
-		label_t *label = labels->data[i];
-		assert(label != NULL);
-
-		label->symbol_index = i;
-
-		// Name
-		bb_add_u32(elf, strtab_data->size);
-		bb_add(strtab_data, label->name.data, label->name.size);
-		bb_add_u8(strtab_data, 0);
-
-		// Info
-		bb_add_u8(elf, (STB_GLOBAL << 4) | STT_NOTYPE);
-
-		// Other
-		bb_add_u8(elf, 0);
-
-		// Section index
-		bb_add_u16(elf, text_index);
-
-		// Value
-		bb_add_u64(elf, label->address);
-
-		// Size
-		bb_add_u64(elf, label->end_address - label->address);
-	}
-
-	//// Relas data
+	// Data
 	for (size_t i = 0; i < sections->size; i++) {
-		section_t *rela_section = sections->data[i];
-		if (!is_rela(rela_section)) {
-			continue;
-		}
-
-		section_t *section = find_section_by_elf_index(sections, *rela_section->info);
-		assert(section != NULL);
-
-		rela_section->bytes = bb_new(4096);
-		assert(rela_section->bytes != NULL);
-
-		for (size_t j = 0; j < patches->size; j++) {
-			patch_t *patch = patches->data[j];
-			if (!sv_eq(patch->label->section->name, section->name)) {
-				continue;
-			}
-
-			bb_add_u64(rela_section->bytes, patch->offset);
-			bb_add_u64(rela_section->bytes, (patch->label->symbol_index << 32) | R_X86_64_64);
-			bb_add_u64(rela_section->bytes, 0);
-		}
+		section_write_data(sections->data[i], elf);
 	}
 
-	//// Strtab data
-	*strtab_data_offset = elf->size;
-	*strtab_data_size = strtab_data->size;
-	bb_add(elf, strtab_data->data, strtab_data->size);
-	bb_free(strtab_data);
-
-	//// Rela.text data
-	// *rela_text_link = symtab_index;
-	// *rela_text_info = text_index;
-
-	// bb_t *rela_text_data = bb_new(4096);
-	// assert(rela_text_data != NULL);
+	// Patch
+	*section_header_entry_count = sections->size;
+	*section_header_shstrtab_index = shstrtab->index_in_sh_table;
 
 	// for (size_t i = 0; i < patches->size; i++) {
 	// 	patch_t *patch = patches->data[i];
 
-	// 	bb_add_u64(rela_text_data, patch->offset);
-	// 	bb_add_u64(rela_text_data, (patch->label->symbol_index << 32) | R_X86_64_64);
-	// 	bb_add_u64(rela_text_data, 0);
+	// 	label_t *label = find_label(user_sections, patch->label_name);
+	// 	assert(label != NULL);
+
+	// 	section_t *section = find_section(sections, label->section_name);
+	// 	assert(section != NULL);
+
+	// 	*patch->patch_address = label->address;
 	// }
 
-	// *rela_text_data_offset = elf->size;
-	// *rela_text_data_size = rela_text_data->size;
-	// bb_add(elf, rela_text_data->data, rela_text_data->size);
-	// bb_free(rela_text_data);
-
-	//// Sections
 	for (size_t i = 0; i < sections->size; i++) {
 		section_t *section = sections->data[i];
 
-		*section->data_size = section->bytes->size;
-		*section->data_offset = elf->size;
-		bb_add(elf, section->bytes->data, section->bytes->size);
+		*section->patch_name_offset = section->name_offset;
+		*section->patch_align = section->align;
+
+		if (section->type == SHT_STRTAB) {
+			*section->patch_align = 1;
+		} else if (section->type == SHT_RELA) {
+			*section->patch_info = section->info;
+			*section->patch_link = section->link;
+			*section->patch_align = 8;
+			*section->patch_entry_size = RELA_ENT_SIZE;
+		}
 	}
 
+	*symtab->patch_align = 8;
+	*symtab->patch_entry_size = SYMTAB_ENT_SIZE;
+	*symtab->patch_info = 1;  // TODO: Set to index of first non-local symbol
+	*symtab->patch_link = strtab->index_in_sh_table;
+
+	// section_t *symtab = find_section(sections, sv_str(".symtab"));
+	assert(symtab != NULL);
+	write_file("out.syms", symtab->data->data, symtab->data->size);
+	
 	return elf;
+
+
+
+	// // Create rela sections
+	// size_t non_rela_sections_count = sections->size;
+	// for (size_t i = 0; i < non_rela_sections_count; i++) {
+	// 	section_t *section = sections->data[i];
+
+	// 	// Create rela if needed
+	// 	bool requires_rela = false;
+	// 	for (size_t i = 0; i < patches->size; i++) {
+	// 		patch_t *patch = patches->data[i];
+	// 		label_t *label = patch->label;
+
+	// 		if (sv_eq(label->section->name, section->name)) {
+	// 			requires_rela = true;
+	// 			break;
+	// 		}
+	// 	}
+
+	// 	if (!requires_rela || section->rela_created) {
+	// 		continue;
+	// 	}
+	// 	section->rela_created = true;
+
+	// 	char *buf = malloc(64);
+	// 	sprintf(buf, ".rela"SV_FMT, SV_ARG(section->name));  // TODO: Bound check
+
+	// 	section_t rela_section = {
+	// 		.bytes = bb_new(4096),
+	// 		.name = sv_str(buf),
+	// 	};
+
+	// 	rela_section.index = *section_header_entry_count;
+	// 	create_elf_section(elf, section_header_entry_count,
+	// 		&rela_section.name_offset,
+	// 		SHT_RELA,
+	// 		0,
+	// 		0,
+	// 		&rela_section.data_offset,
+	// 		&rela_section.data_size,
+	// 		&rela_section.link,
+	// 		&rela_section.info,
+	// 		8,
+	// 		RELA_ENT_SIZE
+	// 	);
+
+	// 	*rela_section.link = symtab_index;
+	// 	*rela_section.info = section->index;
+
+	// 	list_push(sections, heapify(&rela_section, sizeof(rela_section)));
+	// }
+
+	// uint32_t text_index = text->index;
+
+	// // Rela sections
+	// // for (size_t i = 0; i < labels->size; i++) {
+	// // 	label_t *label = labels->data[i];
+	// // 	get_or_create_section();
+
+	// // 	uint32_t *rela_text_name_offset;
+	// // 	uint64_t *rela_text_data_offset;
+	// // 	uint64_t *rela_text_data_size;
+	// // 	uint32_t *rela_text_link;
+	// // 	uint32_t *rela_text_info;
+	// // 	create_elf_section(elf, section_header_entry_count,
+	// // 		&rela_text_name_offset,
+	// // 		SHT_RELA,
+	// // 		0,
+	// // 		0,
+	// // 		&rela_text_data_offset,
+	// // 		&rela_text_data_size,
+	// // 		&rela_text_link,
+	// // 		&rela_text_info,
+	// // 		8,
+	// // 		RELA_ENT_SIZE
+	// // 	);
+	// // }
+
+	// // Section data
+	// *strtab_name_offset = elf->size - *shstrtab_data_offset;
+	// bb_add_str(elf, ".strtab");
+	// bb_add_u8(elf, 0);
+
+	// *symtab_name_offset = elf->size - *shstrtab_data_offset;
+	// bb_add_str(elf, ".symtab");
+	// bb_add_u8(elf, 0);
+
+	// // *rela_text_name_offset = elf->size - *shstrtab_data_offset;
+	// // bb_add_str(elf, ".rela.text");
+	// // bb_add_u8(elf, 0);
+
+	// *shstrtab_data_size = elf->size - *shstrtab_data_offset;
+
+	// //// Symtab data
+	// bb_t *strtab_data = bb_new(4096);
+	// bb_add_u8(strtab_data, 0);
+
+	// *symtab_data_offset = elf->size;
+	// *symtab_data_size = labels->size * SYMTAB_ENT_SIZE;
+	// *symtab_link = strtab_index;
+
+	// for (size_t i = 0; i < labels->size; i++) {
+	// 	label_t *label = labels->data[i];
+	// 	assert(label != NULL);
+
+	// 	label->symbol_index = i;
+
+	// 	// Name
+	// 	bb_add_u32(elf, strtab_data->size);
+	// 	bb_add(strtab_data, label->name.data, label->name.size);
+	// 	bb_add_u8(strtab_data, 0);
+
+	// 	// Info
+	// 	bb_add_u8(elf, (STB_GLOBAL << 4) | STT_NOTYPE);
+
+	// 	// Other
+	// 	bb_add_u8(elf, 0);
+
+	// 	// Section index
+	// 	bb_add_u16(elf, text_index);
+
+	// 	// Value
+	// 	bb_add_u64(elf, label->address);
+
+	// 	// Size
+	// 	bb_add_u64(elf, label->end_address - label->address);
+	// }
+
+	// //// Relas data
+	// for (size_t i = 0; i < sections->size; i++) {
+	// 	section_t *rela_section = sections->data[i];
+	// 	if (!is_rela(rela_section)) {
+	// 		continue;
+	// 	}
+
+	// 	section_t *section = find_section_by_elf_index(sections, *rela_section->info);
+	// 	assert(section != NULL);
+
+	// 	rela_section->bytes = bb_new(4096);
+	// 	assert(rela_section->bytes != NULL);
+
+	// 	for (size_t j = 0; j < patches->size; j++) {
+	// 		patch_t *patch = patches->data[j];
+	// 		if (!sv_eq(patch->label->section->name, section->name)) {
+	// 			continue;
+	// 		}
+
+	// 		bb_add_u64(rela_section->bytes, patch->offset);
+	// 		bb_add_u64(rela_section->bytes, (patch->label->symbol_index << 32) | R_X86_64_64);
+	// 		bb_add_u64(rela_section->bytes, 0);
+	// 	}
+	// }
+
+	// //// Strtab data
+	// *strtab_data_offset = elf->size;
+	// *strtab_data_size = strtab_data->size;
+	// bb_add(elf, strtab_data->data, strtab_data->size);
+	// bb_free(strtab_data);
+
+	// //// Rela.text data
+	// // *rela_text_link = symtab_index;
+	// // *rela_text_info = text_index;
+
+	// // bb_t *rela_text_data = bb_new(4096);
+	// // assert(rela_text_data != NULL);
+
+	// // for (size_t i = 0; i < patches->size; i++) {
+	// // 	patch_t *patch = patches->data[i];
+
+	// // 	bb_add_u64(rela_text_data, patch->offset);
+	// // 	bb_add_u64(rela_text_data, (patch->label->symbol_index << 32) | R_X86_64_64);
+	// // 	bb_add_u64(rela_text_data, 0);
+	// // }
+
+	// // *rela_text_data_offset = elf->size;
+	// // *rela_text_data_size = rela_text_data->size;
+	// // bb_add(elf, rela_text_data->data, rela_text_data->size);
+	// // bb_free(rela_text_data);
+
+	// //// Sections
+	// for (size_t i = 0; i < sections->size; i++) {
+	// 	section_t *section = sections->data[i];
+
+	// 	*section->data_size = section->bytes->size;
+	// 	*section->data_offset = elf->size;
+	// 	bb_add(elf, section->bytes->data, section->bytes->size);
+	// }
+
+	// return elf;
 }
 
 bool startswith_comment(sv_t line) {
@@ -910,7 +1028,7 @@ typedef struct {
 	union {
 		reg_t reg;
 		uint64_t imm;
-		label_t *label;
+		sv_t label;
 	} as;
 } expr_t;
 
@@ -1202,13 +1320,13 @@ bool parse_reg64(tk_t *tk, reg_t *reg) {
 	return false;
 }
 
-bool parse_label(tk_t *tk, label_t **label, list_t *labels) {
+bool parse_label(tk_t *tk, sv_t *label) {
 	if (tk->type != TK_IDENT) {
 		return false;
 	}
 
-	*label = list_find(labels, &tk->as.ident, (eq_func_t)label_eq);
 	assert(label != NULL);
+	*label = tk->as.ident;
 
 	tk_next(tk);
 	return true;
@@ -1224,12 +1342,12 @@ bool parse_i64(tk_t *tk, uint64_t *value) {
 	return true;
 }
 
-bool parse_expr(tk_t *tk, expr_t *expr, list_t *labels) {
+bool parse_expr(tk_t *tk, expr_t *expr) {
 	if (tk->type == TK_IDENT) {
 		if (parse_reg64(tk, &expr->as.reg)) {
 			expr->type = EXPR_REG64;
 			return true;
-		} else if (parse_label(tk, &expr->as.label, labels)) {
+		} else if (parse_label(tk, &expr->as.label)) {
 			expr->type = EXPR_LABEL;
 			return true;
 		}
@@ -1247,27 +1365,32 @@ bool section_eq(section_t *a, section_t *b) {
 	return sv_eq(a->name, b->name);
 }
 
-void set_section(section_t **active_section, list_t *sections, sv_t section_name) {
-	section_t key = {
-		.name = section_name,
-	};
-
-	section_t *section = list_find(sections, &key, (eq_func_t)section_eq);
+void set_section(section_t **active_section, list_t *user_sections, sv_t section_name) {
+	section_t *section = find_section(user_sections, section_name);
 	if (!section) {
-		section_t sect = {0};
-		sect.name = section_name;
-		sect.bytes = bb_new(4096);
-		assert(sect.bytes != NULL);
-		section = heapify(&sect, sizeof(sect));
-		list_push(sections, section);
+		section = list_push(user_sections, section_new(section_name, SHT_PROGBITS, 0));
+
+		// TODO: Let user set these through section directive
+		uint64_t flags = SHF_ALLOC;
+		uint64_t align = 0;
+
+		if (sv_eq(section_name, sv_str(".text"))) {
+			flags |= SHF_EXECINSTR;
+			align = 16;
+		} else if (sv_eq(section_name, sv_str(".data"))) {
+			flags |= SHF_WRITE;
+			align = 4;
+		}
+
+		section->flags = flags;
+		section->align = align;
 	}
 
 	*active_section = section;
 }
 
-void assemble_ret(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
+void assemble_ret(bb_t *code, list_t *patches, tk_t *tk) {
 	(void)patches;
-	(void)labels;
 
 	bb_add_u8(code, 0xc3);
 
@@ -1278,9 +1401,8 @@ void assemble_ret(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
 	}
 }
 
-void assemble_syscall(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
+void assemble_syscall(bb_t *code, list_t *patches, tk_t *tk) {
 	(void)patches;
-	(void)labels;
 
 	bb_add_u8(code, 0x0f);
 	bb_add_u8(code, 0x05);
@@ -1292,11 +1414,9 @@ void assemble_syscall(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
 	}
 }
 
-void assemble_mov(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
-	(void)labels;
-
+void assemble_mov(bb_t *code, list_t *patches, tk_t *tk) {
 	expr_t *dest = expr_new();
-	if (!parse_expr(tk, dest, labels)) {
+	if (!parse_expr(tk, dest)) {
 		fprintf(stderr, "Expected source operand\n");
 		exit(1);
 	}
@@ -1308,7 +1428,7 @@ void assemble_mov(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
 	tk_next(tk);
 
 	expr_t *src = expr_new();
-	if (!parse_expr(tk, src, labels)) {
+	if (!parse_expr(tk, src)) {
 		fprintf(stderr, "Expected destination operand\n");
 		exit(1);
 	}
@@ -1329,10 +1449,9 @@ void assemble_mov(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
 		} break;
 		case EXPR_LABEL: {
 			patch_t patch = {
-				.offset = code->size,
-				.label = src->as.label,
+				.patch_address = bb_add_u64(code, 0),
+				.label_name = src->as.label,
 			};
-			bb_add_u64(code, 0);
 			list_push(patches, heapify(&patch, sizeof(patch)));
 		} break;
 		default: {
@@ -1351,12 +1470,11 @@ void assemble_mov(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
 	}
 }
 
-void assemble_xor(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
+void assemble_xor(bb_t *code, list_t *patches, tk_t *tk) {
 	(void)patches;
-	(void)labels;
 
 	expr_t *dest = expr_new();
-	if (!parse_expr(tk, dest, labels)) {
+	if (!parse_expr(tk, dest)) {
 		fprintf(stderr, "Expected source operand\n");
 		exit(1);
 	}
@@ -1368,7 +1486,7 @@ void assemble_xor(bb_t *code, list_t *patches, list_t *labels, tk_t *tk) {
 	tk_next(tk);
 
 	expr_t *src = expr_new();
-	if (!parse_expr(tk, src, labels)) {
+	if (!parse_expr(tk, src)) {
 		fprintf(stderr, "Expected destination operand\n");
 		exit(1);
 	}
@@ -1404,11 +1522,15 @@ bool try_assemble_label(section_t *active_section, list_t *labels, tk_t *tk) {
 		return false;
 	}
 
-	label_t *label = list_find(labels, &name, (eq_func_t)label_eq);
+	// label_t *label = list_find(labels, &name, (eq_func_t)label_eq);
+	// assert(label != NULL);
+	label_t *label = malloc(sizeof(label_t));
 	assert(label != NULL);
+	list_push(labels, label);
 
-	label->section = active_section;
-	label->address = active_section->bytes->size;
+	label->name = name;
+	label->section_name = active_section->name;
+	label->address = active_section->data->size;
 
 	// consume colon
 	tk_next(tk);
@@ -1484,7 +1606,7 @@ void parse_directive(section_t **active_section, list_t *sections, list_t *patch
 	}
 
 	if (sv_eq(tk->as.ident, sv_str("bytes"))) {
-		parse_bytes((*active_section)->bytes, patches, labels, tk);
+		parse_bytes((*active_section)->data, patches, labels, tk);
 	} else if (sv_eq(tk->as.ident, sv_str("section"))) {
 		parse_section(active_section, sections, patches, labels, tk);
 	} else {
@@ -1493,7 +1615,7 @@ void parse_directive(section_t **active_section, list_t *sections, list_t *patch
 	}
 }
 
-list_t *assemble(list_t *patches, list_t *labels, const char *source_path, const char *source_str) {
+list_t *assemble(const char *source_path, const char *source_str) {
 	list_t *sections = list_new();
 	assert(sections != NULL);
 
@@ -1512,7 +1634,7 @@ list_t *assemble(list_t *patches, list_t *labels, const char *source_path, const
 		}
 
 		if (tk.type == TK_AT) {
-			parse_directive(&active_section, sections, patches, labels, &tk);
+			parse_directive(&active_section, sections, active_section->patches, active_section->labels, &tk);
 			continue;
 		}
 
@@ -1523,7 +1645,7 @@ list_t *assemble(list_t *patches, list_t *labels, const char *source_path, const
 
 		const char *start_pos = tk_pos(tk);
 
-		if (try_assemble_label(active_section, labels, &tk)) {
+		if (try_assemble_label(active_section, active_section->labels, &tk)) {
 			continue;
 		}
 
@@ -1531,15 +1653,16 @@ list_t *assemble(list_t *patches, list_t *labels, const char *source_path, const
 		sv_t ident = tk.as.ident;
 		tk_next(&tk);
 
-		bb_t *code = (*active_section).bytes;
+		bb_t *code = (*active_section).data;
+		list_t *patches = (*active_section).patches;
 		if (sv_eq(ident, sv_str("ret"))) {
-			assemble_ret(code, patches, labels, &tk);
+			assemble_ret(code, patches, &tk);
 		} else if (sv_eq(ident, sv_str("mov"))) {
-			assemble_mov(code, patches, labels, &tk);
+			assemble_mov(code, patches, &tk);
 		} else if (sv_eq(ident, sv_str("xor"))) {
-			assemble_xor(code, patches, labels, &tk);
+			assemble_xor(code, patches, &tk);
 		} else if (sv_eq(ident, sv_str("syscall"))) {
-			assemble_syscall(code, patches, labels, &tk);
+			assemble_syscall(code, patches, &tk);
 		} else {
 			// error, expected a label
 			fprintf(stderr, "%s: Expected label or instruction\n", start_pos);
@@ -1562,37 +1685,34 @@ int main(int argc, char *argv[]) {
 
 	check_source(source_path, source_str);
 
-	list_t *labels = list_new();
-	assert(labels != NULL);
+	// TODO: Implement first pass to get labels
+	// list_t *labels = list_new();
+	// assert(labels != NULL);
 
-	get_labels(labels, source_path, source_str);
+	// get_labels(labels, source_path, source_str);
 
 	// Second pass, assemble instructions
-	list_t *patches = list_new();
-	assert(patches != NULL);
-
-	list_t *sections = assemble(patches, labels, source_path, source_str);
+	list_t *sections = assemble(source_path, source_str);
 	assert(sections != NULL);
 
-	// Apply patches
-	// for (size_t i = 0; i < patches->size; i++) {
-	// 	patch_t *patch = patches->data[i];
-	// 	*patch->value = patch->label->address;
-	// }
+	for (size_t i = 0; i < sections->size; i++) {
+		section_t *section = sections->data[i];
+		assert(section != NULL);
 
-	for (size_t i = 0; i < labels->size; i++) {
-		label_t *label = labels->data[i];
-		assert(label != NULL);
-		label->end_address = label->section->bytes->size;
-		if (i > 0) {
-			((label_t *)labels->data[i - 1])->end_address = label->address;
+		for (size_t j = 0; j < section->labels->size; j++) {
+			label_t *label = section->labels->data[j];
+			assert(label != NULL);
+
+			label->end_address = section->data->size;
+			if (j > 0) {
+				((label_t *)section->labels->data[j - 1])->end_address = label->address;
+			}
 		}
 	}
 
-	bb_t *elf = create_elf(sections, labels, patches);
+	bb_t *elf = create_elf(sections);
 	assert(write_file("out.o", elf->data, elf->size));
 
-	list_free(labels, NULL);
 	list_free(sections, (free_func_t)section_free);
 	bb_free(elf);
 	free((char *)source_str);
